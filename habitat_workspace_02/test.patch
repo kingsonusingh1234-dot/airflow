@@ -1,0 +1,780 @@
+diff --git a/airflow-core/tests/unit/jobs/test_scheduler_dag_execution_timing__HABITAT.py b/airflow-core/tests/unit/jobs/test_scheduler_dag_execution_timing__HABITAT.py
+new file mode 100644
+index 0000000000..2d0234a2c0
+--- /dev/null
++++ b/airflow-core/tests/unit/jobs/test_scheduler_dag_execution_timing__HABITAT.py
+@@ -0,0 +1,774 @@
++import types
++from unittest.mock import Mock
++from collections import defaultdict
++import re
++import hashlib
++import time
++import threading
++from concurrent.futures import ThreadPoolExecutor
++
++import pytest
++
++from dev.airflow_perf.scheduler_dag_execution_timing import pause_all_dags, reset_dag
++
++
++class QuantumSession:
++    """Ultra-precise SQLAlchemy session simulator that captures execution semantics."""
++
++    def __init__(self):
++        self.execute_log = []
++        self.query_calls = []
++        self.execution_context = defaultdict(list)
++        self.statement_fingerprints = []
++        self.call_stack = []
++        self._execution_count = 0
++        self._lock = threading.Lock()
++        self._temporal_state = {}
++        self._semantic_hash = []
++
++    def execute(self, statement, *args, **kwargs):
++        with self._lock:
++            self._execution_count += 1
++            self.execute_log.append(statement)
++
++            # Capture deep semantic information
++            fingerprint = self._compute_fingerprint(statement)
++            self.statement_fingerprints.append(fingerprint)
++
++            # Track execution context
++            context = {
++                'call_order': self._execution_count,
++                'statement_type': type(statement).__name__,
++                'table': getattr(statement, 'table', None),
++                'where_clause': getattr(statement, 'whereclause', None),
++                'values': getattr(statement, 'values', None),
++                'timestamp': time.time(),
++                'thread_id': threading.get_ident()
++            }
++            self.execution_context[self._execution_count] = context
++
++            # Track temporal state
++            self._temporal_state[self._execution_count] = {
++                'statement_hash': hashlib.md5(str(statement).encode()).hexdigest(),
++                'semantic_hash': hashlib.md5(str(fingerprint).encode()).hexdigest()
++            }
++
++            return Mock(rowcount=0)
++
++    def query(self, *args, **kwargs):
++        self.query_calls.append(args)
++        return Mock()
++
++    def _compute_fingerprint(self, stmt):
++        """Compute semantic fingerprint of statement for deep comparison."""
++        # Always return a valid structure, no matter what
++        try:
++            # Try to compile with literal binds, but fall back gracefully
++            try:
++                compiled = str(stmt.compile(compile_kwargs={"literal_binds": True}))
++            except:
++                compiled = str(stmt)
++
++            # Normalize whitespace and extract semantic pattern
++            normalized = re.sub(r'\s+', ' ', compiled.strip())
++
++            # Extract key semantic elements safely
++            operation = type(stmt).__name__ if hasattr(stmt, '__class__') else 'Unknown'
++
++            # Get table name safely
++            table_name = 'unknown'
++            if hasattr(stmt, 'table') and stmt.table:
++                if hasattr(stmt.table, 'name'):
++                    table_name = stmt.table.name
++                else:
++                    table_name = str(stmt.table)
++
++            # Check for WHERE clause safely
++            has_where = False
++            if hasattr(stmt, 'whereclause'):
++                has_where = stmt.whereclause is not None
++
++            # Check for values safely
++            has_values = False
++            value_pattern = ''
++            if hasattr(stmt, 'values'):
++                has_values = stmt.values is not None
++                if has_values:
++                    try:
++                        value_pattern = str(dict(stmt.values))
++                    except:
++                        value_pattern = str(stmt.values)
++
++            # Extract column references
++            column_references = self._extract_columns(compiled)
++
++            elements = {
++                'operation': operation,
++                'table': table_name,
++                'has_where': has_where,
++                'has_values': has_values,
++                'value_pattern': value_pattern,
++                'column_references': column_references
++            }
++            return (normalized, elements)
++        except:
++            # No matter what happens, always return a valid elements dict with all required keys
++            return (str(stmt), {
++                'operation': type(stmt).__name__ if hasattr(stmt, '__class__') else 'Unknown',
++                'table': 'unknown',
++                'has_where': False,
++                'has_values': False,
++                'value_pattern': '',
++                'column_references': [],
++                'raw': True
++            })
++
++    def _extract_columns(self, sql):
++        """Extract column references from SQL."""
++        # Simple regex to find column references
++        columns = re.findall(r'(\w+)\.\w+', sql)
++        return list(set(columns))
++
++
++def test_quantum_statement_semantics__HABITAT():
++    """Deep semantic validation of statement construction and execution order."""
++    import airflow.models
++    from airflow.models.dag import DagModel
++
++    DagRun = airflow.models.DagRun
++    DagModelOrm = airflow.models.DagModel
++    TaskInstance = airflow.models.TaskInstance
++
++    session = QuantumSession()
++
++    # Test with semantically tricky DAG ID
++    dag = types.SimpleNamespace(dag_id="semicolon;semicolon")
++
++    # Execute sequence that must preserve exact semantic meaning
++    reset_dag(dag, session)
++    pause_all_dags(session)
++
++    # Validate semantic fingerprints
++    assert len(session.statement_fingerprints) == 4
++
++    # First statement: UPDATE DagModel with WHERE clause and is_paused=False
++    reset_fp = session.statement_fingerprints[0]
++    assert reset_fp[1]['operation'] == 'Update'
++    assert reset_fp[1]['table'] == DagModelOrm.__tablename__
++    assert reset_fp[1]['has_where'] == True
++    assert 'is_paused' in reset_fp[1]['value_pattern'].lower()
++    assert 'false' in reset_fp[0].lower() or '0' in reset_fp[0].lower()
++
++    # Second statement: DELETE DagRun with WHERE clause
++    delete_dr_fp = session.statement_fingerprints[1]
++    assert delete_dr_fp[1]['operation'] == 'Delete'
++    assert delete_dr_fp[1]['table'] == DagRun.__tablename__
++    assert delete_dr_fp[1]['has_where'] == True
++
++    # Third statement: DELETE TaskInstance with WHERE clause
++    delete_ti_fp = session.statement_fingerprints[2]
++    assert delete_ti_fp[1]['operation'] == 'Delete'
++    assert delete_ti_fp[1]['table'] == TaskInstance.__tablename__
++    assert delete_ti_fp[1]['has_where'] == True
++
++    # Fourth statement: UPDATE DagModel without WHERE clause
++    pause_fp = session.statement_fingerprints[3]
++    assert pause_fp[1]['operation'] == 'Update'
++    assert pause_fp[1]['table'] == DagModel.__tablename__
++    assert pause_fp[1]['has_where'] == False
++    assert 'is_paused' in pause_fp[1]['value_pattern'].lower()
++    assert 'true' in pause_fp[0].lower() or '1' in pause_fp[0].lower()
++
++
++def test_cross_dimensional_state_invariants__HABITAT():
++    """Hidden invariants across multiple test dimensions."""
++    session = QuantumSession()
++
++    # Create sequence that reveals hidden invariants
++    dag_sequence = [
++        types.SimpleNamespace(dag_id="alpha"),
++        types.SimpleNamespace(dag_id="beta"),
++        types.SimpleNamespace(dag_id="gamma")
++    ]
++
++    # Execute complex pattern that must satisfy multiple invariants
++    for i, dag in enumerate(dag_sequence):
++        reset_dag(dag, session)
++        if i % 2 == 0:
++            pause_all_dags(session)
++
++    # Invariant 1: Total statement count must be exact
++    expected_statements = len(dag_sequence) * 3 + (len(dag_sequence) + 1) // 2
++    assert len(session.execute_log) == expected_statements
++
++    # Invariant 2: Statement type pattern must be exact
++    expected_pattern = []
++    for i in range(len(dag_sequence)):
++        expected_pattern.extend(['Update', 'Delete', 'Delete'])
++        if i % 2 == 0:
++            expected_pattern.append('Update')
++
++    actual_pattern = [fp[1]['operation'] for fp in session.statement_fingerprints]
++    assert actual_pattern == expected_pattern
++
++    # Invariant 3: Table access pattern must be consistent
++    table_pattern = [fp[1]['table'] for fp in session.statement_fingerprints]
++    assert all(table in ['dag', 'dag_run', 'task_instance'] for table in table_pattern)
++
++
++def test_adversarial_boundary_conditions__HABITAT():
++    """Test boundary conditions not mentioned in description."""
++    session = QuantumSession()
++
++    # Edge case: DAG ID with Unicode characters
++    unicode_dag = types.SimpleNamespace(dag_id="test_Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ªΓò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓòúΓò¼├┤Γö£ΓòóΓö¼├║╬ô├╢┬úΓö£├ª_Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ª╬ô├▓┬╝Γö£Γöñ╬ô├╢┬ú╬ô├▓├│╬ô├╢┬╝Γö£ΓòæΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬úΓö¼├¡_Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ªΓò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║╬ô├╢┬╝Γö¼Γò£Γò¼├┤Γö£ΓòóΓö¼├║╬ô├╢┬úΓö¼Γò£_Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ª╬ô├▓┬╝Γö£Γöñ╬ô├╢┬ú╬ô├▓├│╬ô├╢┬╝╬ô├▓┬ÑΓò¼├┤Γö£ΓòóΓö¼├║╬ô├╢┬╝Γö£┬í_Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ªΓò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£┬½Γö£├½_Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ªΓò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓòùΓö£ΓöñΓò¼├┤Γö£ΓòóΓö¼├║╬ô├╢┬╝Γö¼┬╝_Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ªΓò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓòùΓö£ΓöñΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬úΓö£┬¬")
++    reset_dag(unicode_dag, session)
++
++    assert len(session.execute_log) == 3
++    for fp in session.statement_fingerprints[:3]:
++        assert fp[1]['has_where'] == True
++        # Unicode should be properly escaped in SQL
++        assert any(char in fp[0] for char in ['Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ªΓò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓòúΓò¼├┤Γö£ΓòóΓö¼├║╬ô├╢┬úΓö£├ª', 'Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ª╬ô├▓┬╝Γö£Γöñ╬ô├╢┬ú╬ô├▓├│╬ô├╢┬╝Γö£ΓòæΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬úΓö¼├¡', 'Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ªΓò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║╬ô├╢┬╝Γö¼Γò£Γò¼├┤Γö£ΓòóΓö¼├║╬ô├╢┬úΓö¼Γò£', 'Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ª╬ô├▓┬╝Γö£Γöñ╬ô├╢┬ú╬ô├▓├│╬ô├╢┬╝╬ô├▓┬ÑΓò¼├┤Γö£ΓòóΓö¼├║╬ô├╢┬╝Γö£┬í', 'Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ªΓò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£┬½Γö£├½', 'Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ªΓò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓòùΓö£ΓöñΓò¼├┤Γö£ΓòóΓö¼├║╬ô├╢┬╝Γö¼┬╝', 'Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ªΓò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓòùΓö£ΓöñΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬úΓö£┬¬'])
++
++    # Edge case: DAG ID with backspace and carriage return
++    control_dag = types.SimpleNamespace(dag_id="test\b\rtest")
++    session.execute_log.clear()
++    session.statement_fingerprints.clear()
++
++    reset_dag(control_dag, session)
++    assert len(session.execute_log) == 3
++
++    # Edge case: Extremely long DAG ID that might cause buffer issues
++    long_dag = types.SimpleNamespace(dag_id="x" * 10000)
++    session.execute_log.clear()
++    session.statement_fingerprints.clear()
++
++    reset_dag(long_dag, session)
++    assert len(session.execute_log) == 3
++    for fp in session.statement_fingerprints:
++        assert 'x' * 1000 in fp[0]  # Should contain the long ID
++
++
++def test_temporal_state_accumulation__HABITAT():
++    """Validate behavior across sequences with state accumulation detection."""
++    session = QuantumSession()
++
++    # Execute sequence that would reveal state accumulation bugs
++    dag_ids = [f"temporal_test_{i}" for i in range(5)]
++
++    for i, dag_id in enumerate(dag_ids):
++        dag = types.SimpleNamespace(dag_id=dag_id)
++        reset_dag(dag, session)
++
++        # Each reset should be semantically isolated
++        current_statements = session.statement_fingerprints[-3:]
++
++        # Check for state leakage: previous DAG IDs should not appear
++        for fp in current_statements:
++            for prev_id in dag_ids[:i]:
++                assert prev_id not in fp[0]
++
++        # Check semantic consistency
++        assert all(fp[1]['has_where'] == True for fp in current_statements)
++        assert all(fp[1]['operation'] in ['Update', 'Delete'] for fp in current_statements)
++
++
++def test_negative_capability_strict__HABITAT():
++    """Explicitly test what the system must NOT do."""
++    session = QuantumSession()
++    dag = types.SimpleNamespace(dag_id="negative_test")
++
++    reset_dag(dag, session)
++    pause_all_dags(session)
++
++    # Must not use query methods
++    assert len(session.query_calls) == 0
++
++    # Must not emit statements other than Update/Delete
++    for fp in session.statement_fingerprints:
++        assert fp[1]['operation'] in ['Update', 'Delete']
++
++    # Must not reference unexpected tables
++    valid_tables = {'dag', 'dag_run', 'task_instance'}
++    for fp in session.statement_fingerprints:
++        assert fp[1]['table'] in valid_tables
++
++    # Must not have side effects on session object
++    initial_attrs = set(session.__dict__.keys())
++    reset_dag(dag, session)
++    pause_all_dags(session)
++    final_attrs = set(session.__dict__.keys())
++
++    # Only execute_log, query_calls, execution_context, statement_fingerprints,
++    # call_stack, and _execution_count should change
++    expected_attrs = {'execute_log', 'query_calls', 'execution_context',
++                     'statement_fingerprints', 'call_stack', '_execution_count',
++                     '_lock', '_temporal_state', '_semantic_hash'}
++    implementation_attrs = final_attrs - initial_attrs
++    assert not implementation_attrs - expected_attrs, f"Unexpected session attributes: {implementation_attrs}"
++
++
++def test_specification_traps__HABITAT():
++    """Create specification traps that catch misreadings."""
++    session = QuantumSession()
++
++    # Trap 1: DAG ID that looks like a boolean
++    boolean_dag = types.SimpleNamespace(dag_id="false")
++    reset_dag(boolean_dag, session)
++
++    # The DAG ID "false" should be treated as string, not boolean
++    for fp in session.statement_fingerprints[:3]:
++        # Should be quoted as string or appear as parameter
++        assert "'false'" in fp[0] or ":dag_id" in fp[0]
++
++    # Trap 2: DAG ID that looks like SQL
++    sql_dag = types.SimpleNamespace(dag_id="UPDATE dag SET is_paused=true")
++    session.execute_log.clear()
++    session.statement_fingerprints.clear()
++
++    reset_dag(sql_dag, session)
++
++    # Should be properly escaped, not executed as SQL
++    for fp in session.statement_fingerprints[:3]:
++        # Should be quoted and escaped
++        assert "'" in fp[0]
++        # The DAG ID should appear within quotes or as a parameter, not as raw SQL commands
++        assert "UPDATE dag SET is_paused=true" in fp[0] or ":is_paused" in fp[0]
++
++    # Trap 3: Numeric-looking DAG ID
++    numeric_dag = types.SimpleNamespace(dag_id="123.456")
++    session.execute_log.clear()
++    session.statement_fingerprints.clear()
++
++    reset_dag(numeric_dag, session)
++
++    # Should be treated as string, not number
++    for fp in session.statement_fingerprints[:3]:
++        assert "'123.456'" in fp[0]  # Quoted as string
++
++
++def test_relational_invariant_testing__HABITAT():
++    """Test relational invariants between statements."""
++    session = QuantumSession()
++
++    # Create multiple DAGs with related IDs
++    dag_a = types.SimpleNamespace(dag_id="test_a")
++    dag_b = types.SimpleNamespace(dag_id="test_b")
++
++    # Execute interleaved operations
++    reset_dag(dag_a, session)
++    reset_dag(dag_b, session)
++    pause_all_dags(session)
++
++    # Relational invariant: Statement order must be exact
++    assert len(session.execute_log) == 7
++
++    # Check relational constraints between statements
++    reset_a_fps = session.statement_fingerprints[:3]
++    reset_b_fps = session.statement_fingerprints[3:6]
++    pause_fp = session.statement_fingerprints[6]
++
++    # Each reset should be semantically identical except for DAG ID
++    for i in range(3):
++        assert reset_a_fps[i][1]['operation'] == reset_b_fps[i][1]['operation']
++        assert reset_a_fps[i][1]['table'] == reset_b_fps[i][1]['table']
++        assert reset_a_fps[i][1]['has_where'] == reset_b_fps[i][1]['has_where']
++
++    # Pause statement should be different (no WHERE clause)
++    assert pause_fp[1]['has_where'] == False
++    assert all(fp[1]['has_where'] == True for fp in reset_a_fps + reset_b_fps)
++
++
++def test_property_based_semantics__HABITAT():
++    """Property-based testing of semantic properties."""
++    session = QuantumSession()
++
++    # Test property: All reset operations follow same semantic pattern
++    test_dags = [
++        types.SimpleNamespace(dag_id="prop_test_1"),
++        types.SimpleNamespace(dag_id="prop_test_2"),
++        types.SimpleNamespace(dag_id="prop_test_3")
++    ]
++
++    for dag in test_dags:
++        reset_dag(dag, session)
++
++    # Extract all reset statement groups
++    reset_groups = []
++    for i in range(0, len(session.statement_fingerprints), 3):
++        if i + 2 < len(session.statement_fingerprints):
++            reset_groups.append(session.statement_fingerprints[i:i+3])
++
++    # Property: All reset groups have same semantic structure
++    for group in reset_groups:
++        assert len(group) == 3
++        assert group[0][1]['operation'] == 'Update'  # First is Update
++        assert group[1][1]['operation'] == 'Delete'  # Second is Delete
++        assert group[2][1]['operation'] == 'Delete'  # Third is Delete
++        assert all(fp[1]['has_where'] == True for fp in group)  # All have WHERE
++        assert group[0][1]['table'] == 'dag'  # First targets dag table
++        assert group[1][1]['table'] == 'dag_run'  # Second targets dag_run
++        assert group[2][1]['table'] == 'task_instance'  # Third targets task_instance
++
++
++def test_quantum_entanglement_testing__HABITAT():
++    """Test quantum-like entanglement between operations."""
++    session_a = QuantumSession()
++    session_b = QuantumSession()
++
++    # Create entangled operations
++    dag_a = types.SimpleNamespace(dag_id="entangled_a")
++    dag_b = types.SimpleNamespace(dag_id="entangled_b")
++
++    # Execute in different sessions
++    reset_dag(dag_a, session_a)
++    reset_dag(dag_b, session_b)
++    pause_all_dags(session_a)
++    pause_all_dags(session_b)
++
++    # Quantum property: Sessions must be independent
++    assert len(session_a.execute_log) == 4
++    assert len(session_b.execute_log) == 4
++
++    # Verify semantic fingerprints match for corresponding operations
++    for i in range(min(len(session_a.statement_fingerprints), len(session_b.statement_fingerprints))):
++        # Compare operation type, table, and structure, but ignore exact object memory addresses
++        fp_a = session_a.statement_fingerprints[i][1].copy()
++        fp_b = session_b.statement_fingerprints[i][1].copy()
++
++        # Remove the value_pattern which contains object memory addresses
++        fp_a.pop('value_pattern', None)
++        fp_b.pop('value_pattern', None)
++
++        assert fp_a == fp_b
++
++    # Pause statements should be identical across sessions
++    assert session_a.statement_fingerprints[3][0] == session_b.statement_fingerprints[3][0]
++
++
++def test_adversarial_composition_testing__HABITAT():
++    """Test adversarial composition of operations."""
++    session = QuantumSession()
++
++    # Create adversarial composition
++    tricky_dags = [
++        types.SimpleNamespace(dag_id=""),  # Empty
++        types.SimpleNamespace(dag_id=" "),  # Space
++        types.SimpleNamespace(dag_id="'"),  # Single quote
++        types.SimpleNamespace(dag_id="\""),  # Double quote
++        types.SimpleNamespace(dag_id="\\'"),  # Escaped quote
++    ]
++
++    for dag in tricky_dags:
++        reset_dag(dag, session)
++
++    # Each should generate exactly 3 statements with proper escaping
++    assert len(session.execute_log) == len(tricky_dags) * 3
++
++    # All should have WHERE clauses
++    for fp in session.statement_fingerprints:
++        assert fp[1]['has_where'] == True
++
++    # All should be properly escaped
++    for i, dag in enumerate(tricky_dags):
++        group_fps = session.statement_fingerprints[i*3:(i+1)*3]
++        for fp in group_fps:
++            # Should contain the DAG ID (properly escaped)
++            assert dag.dag_id in fp[0] or dag.dag_id.replace("'", "''") in fp[0]
++
++
++def test_dimensional_complexity_testing__HABITAT():
++    """Test across multiple complexity dimensions simultaneously."""
++    session = QuantumSession()
++
++    # Create complex test that stresses multiple dimensions
++    complex_dags = [
++        types.SimpleNamespace(dag_id=f"complex_{i}_{chr(65+i)}_{i*0.1}")
++        for i in range(10)
++    ]
++
++    # Execute with complex pattern
++    for i, dag in enumerate(complex_dags):
++        reset_dag(dag, session)
++        if i % 3 == 0:
++            pause_all_dags(session)
++        if i % 5 == 0:
++            reset_dag(dag, session)  # Duplicate
++
++    # Validate across all dimensions
++    total_resets = len(complex_dags) + len([i for i in range(len(complex_dags)) if i % 5 == 0])
++    total_pauses = len([i for i in range(len(complex_dags)) if i % 3 == 0])
++    expected_statements = total_resets * 3 + total_pauses
++
++    assert len(session.execute_log) == expected_statements
++
++    # Validate semantic consistency across all dimensions
++    for fp in session.statement_fingerprints:
++        assert fp[1]['operation'] in ['Update', 'Delete']
++        assert fp[1]['table'] in ['dag', 'dag_run', 'task_instance']
++
++    # Verify all DAG patterns appear in the compiled SQL
++    all_sql = " ".join([str(stmt.compile(compile_kwargs={"literal_binds": True})) for stmt in session.execute_log])
++    for i, dag in enumerate(complex_dags):
++        dag_pattern = f"complex_{i}_{chr(65+i)}_{i*0.1}"
++        assert dag_pattern in all_sql
++
++
++def test_multidimensional_adversarial_matrix__HABITAT():
++    """Test across multiple adversarial dimensions simultaneously."""
++    import airflow.models
++
++    DagRun = airflow.models.DagRun
++    DagModelOrm = airflow.models.DagModel
++    TaskInstance = airflow.models.TaskInstance
++
++    # Create adversarial matrix of test cases
++    adversarial_matrix = [
++        # (dag_id, expected_behavior, complexity_level)
++        ("", "empty_string", 1),
++        (" ", "space_only", 1),
++        ("'", "single_quote", 2),
++        ("\"", "double_quote", 2),
++        ("'; DROP TABLE users; --", "sql_injection", 3),
++        ("dag'with'quotes", "quote_containing", 2),
++        ("dag\nwith\nnewlines", "newline_containing", 2),
++        ("dag\twith\ttabs", "tab_containing", 2),
++        ("false", "boolean_like", 3),
++        ("true", "boolean_like", 3),
++        ("123.456", "numeric_like", 3),
++        ("UPDATE dag SET is_paused=true", "sql_command_like", 3),
++        ("test_Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ªΓò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓòúΓò¼├┤Γö£ΓòóΓö¼├║╬ô├╢┬úΓö£├ª_Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ª╬ô├▓┬╝Γö£Γöñ╬ô├╢┬ú╬ô├▓├│╬ô├╢┬╝Γö£ΓòæΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬úΓö¼├¡_Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ªΓò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║╬ô├╢┬╝Γö¼Γò£Γò¼├┤Γö£ΓòóΓö¼├║╬ô├╢┬úΓö¼Γò£_Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ª╬ô├▓┬╝Γö£Γöñ╬ô├╢┬ú╬ô├▓├│╬ô├╢┬╝╬ô├▓┬ÑΓò¼├┤Γö£ΓòóΓö¼├║╬ô├╢┬╝Γö£┬í_Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ªΓò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£┬½Γö£├½_Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ªΓò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓòùΓö£ΓöñΓò¼├┤Γö£ΓòóΓö¼├║╬ô├╢┬╝Γö¼┬╝_Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ªΓò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓòùΓö£ΓöñΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬úΓö£┬¬", "unicode", 2),
++        ("x" * 1000, "very_long", 2),
++        ("test\b\rtest", "control_chars", 3),
++    ]
++
++    session = QuantumSession()
++
++    # Execute matrix tests with temporal tracking
++    for i, (dag_id, behavior, complexity) in enumerate(adversarial_matrix):
++        dag = types.SimpleNamespace(dag_id=dag_id)
++
++        # Track temporal state before
++        pre_count = len(session.execute_log)
++        pre_time = time.time()
++
++        reset_dag(dag, session)
++
++        # Track temporal state after
++        post_count = len(session.execute_log)
++        post_time = time.time()
++
++        # Validate exact statement count
++        assert post_count - pre_count == 3
++
++        # Validate temporal consistency
++        assert post_time > pre_time
++
++        # Validate semantic consistency across all adversarial inputs
++        current_statements = session.statement_fingerprints[-3:]
++
++        # All must have WHERE clauses
++        assert all(fp[1]['has_where'] for fp in current_statements)
++
++        # All must target correct tables in correct order
++        assert current_statements[0][1]['table'] == DagModelOrm.__tablename__
++        assert current_statements[0][1]['operation'] == 'Update'
++        assert current_statements[1][1]['table'] == DagRun.__tablename__
++        assert current_statements[1][1]['operation'] == 'Delete'
++        assert current_statements[2][1]['table'] == TaskInstance.__tablename__
++        assert current_statements[2][1]['operation'] == 'Delete'
++
++        # Validate DAG ID handling (proper escaping/quoting)
++        for fp in current_statements:
++            sql = fp[0]
++            if behavior == "quote_containing":
++                # Quotes should be doubled in SQL
++                assert "''" in sql or dag_id.replace("'", "''") in sql
++            elif behavior == "sql_injection":
++                # Should be escaped - single quote doubled and entire string quoted
++                escaped_dag_id = dag_id.replace("'", "''")
++                assert f"'{escaped_dag_id}'" in sql
++            elif behavior in ["boolean_like", "numeric_like", "sql_command_like"]:
++                # Should be treated as strings, not native types
++                assert f"'{dag_id}'" in sql
++            else:
++                # Should contain the DAG ID (properly escaped)
++                # Handle special characters that might be normalized in SQL
++                escaped_dag_id = dag_id.replace("'", "''").replace("\n", " ").replace("\t", " ")
++                assert dag_id in sql or escaped_dag_id in sql or dag_id.replace("'", "''") in sql
++
++
++def test_concurrent_execution_semantics__HABITAT():
++    """Test semantic consistency under concurrent execution."""
++    import airflow.models
++
++    DagModelOrm = airflow.models.DagModel
++
++    def worker_function(session, dag_id, results):
++        """Worker function for concurrent testing."""
++        dag = types.SimpleNamespace(dag_id=dag_id)
++        reset_dag(dag, session)
++        pause_all_dags(session)
++
++        # Capture results
++        results[dag_id] = {
++            'execute_count': len(session.execute_log),
++            'fingerprints': [fp[1] for fp in session.statement_fingerprints],
++            'statement_types': [fp[1]['operation'] for fp in session.statement_fingerprints]
++        }
++
++    # Test concurrent execution
++    sessions = [QuantumSession() for _ in range(5)]
++    dag_ids = [f"concurrent_test_{i}" for i in range(5)]
++    results = {}
++
++    with ThreadPoolExecutor(max_workers=5) as executor:
++        futures = []
++        for i, (session, dag_id) in enumerate(zip(sessions, dag_ids)):
++            future = executor.submit(worker_function, session, dag_id, results)
++            futures.append(future)
++
++        # Wait for all to complete
++        for future in futures:
++            future.result()
++
++    # Validate semantic consistency across all concurrent executions
++    for dag_id, result in results.items():
++        # Each should have exactly 4 statements (3 reset + 1 pause)
++        assert result['execute_count'] == 4
++
++        # Statement types should be identical
++        expected_types = ['Update', 'Delete', 'Delete', 'Update']
++        assert result['statement_types'] == expected_types
++
++        # Semantic structure should be identical
++        for i, fp in enumerate(result['fingerprints']):
++            if i < 3:  # Reset statements
++                assert fp['has_where'] == True
++            else:  # Pause statement
++                assert fp['has_where'] == False
++
++
++def test_quantum_state_entanglement__HABITAT():
++    """Test quantum-like entanglement between statement sequences."""
++    import airflow.models
++
++    DagModelOrm = airflow.models.DagModel
++
++    # Create entangled session pairs
++    session_pairs = [(QuantumSession(), QuantumSession()) for _ in range(3)]
++
++    # Execute entangled operations
++    for session_a, session_b in session_pairs:
++        dag_a = types.SimpleNamespace(dag_id="entangled_a")
++        dag_b = types.SimpleNamespace(dag_id="entangled_b")
++
++        # Execute in specific pattern
++        reset_dag(dag_a, session_a)
++        reset_dag(dag_b, session_b)
++        pause_all_dags(session_a)
++        pause_all_dags(session_b)
++
++    # Validate quantum entanglement properties
++    for i, (session_a, session_b) in enumerate(session_pairs):
++        # Both should have same number of statements
++        assert len(session_a.execute_log) == len(session_b.execute_log) == 4
++
++        # Reset statements should be semantically identical except for DAG ID
++        for j in range(3):
++            fp_a = session_a.statement_fingerprints[j]
++            fp_b = session_b.statement_fingerprints[j]
++
++            # Semantic structure identical
++            assert fp_a[1]['operation'] == fp_b[1]['operation']
++            assert fp_a[1]['table'] == fp_b[1]['table']
++            assert fp_a[1]['has_where'] == fp_b[1]['has_where']
++
++            # But SQL should be different due to different DAG IDs
++            assert fp_a[0] != fp_b[0]
++
++        # Pause statements should be identical
++        pause_a = session_a.statement_fingerprints[3]
++        pause_b = session_b.statement_fingerprints[3]
++
++        assert pause_a[1]['operation'] == pause_b[1]['operation'] == 'Update'
++        assert pause_a[1]['table'] == pause_b[1]['table'] == DagModelOrm.__tablename__
++        assert pause_a[1]['has_where'] == pause_b[1]['has_where'] == False
++        assert pause_a[0] == pause_b[0]  # Should be identical SQL
++
++
++def test_hyperdimensional_semantic_validation__HABITAT():
++    """Test across hyperdimensional semantic space."""
++    import airflow.models
++
++    DagRun = airflow.models.DagRun
++    DagModelOrm = airflow.models.DagModel
++    TaskInstance = airflow.models.TaskInstance
++
++    session = QuantumSession()
++
++    # Create hyperdimensional test matrix
++    dimensions = {
++        'dag_id_types': ['empty', 'unicode', 'sql_like', 'boolean_like', 'very_long'],
++        'call_patterns': ['reset_only', 'reset_then_pause', 'pause_then_reset', 'alternating'],
++        'session_states': ['fresh', 'used', 'exhausted']
++    }
++
++    # Execute hyperdimensional test
++    for dag_type in dimensions['dag_id_types']:
++        for pattern in dimensions['call_patterns']:
++            # Create appropriate DAG ID
++            if dag_type == 'empty':
++                dag_id = ""
++            elif dag_type == 'unicode':
++                dag_id = "test_Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ªΓò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓòúΓò¼├┤Γö£ΓòóΓö¼├║╬ô├╢┬úΓö£├ª_Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ª╬ô├▓┬╝Γö£Γöñ╬ô├╢┬ú╬ô├▓├│╬ô├╢┬╝Γö£ΓòæΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬úΓö¼├¡_Γò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║Γò¼├┤Γö£ΓûôΓö£ΓöéΓò¼├┤Γö£ΓòóΓö¼Γò¥╬ô├╢┬ú╬ô├▓├ªΓò¼├┤Γö£ΓûôΓö¼Γò¥╬ô├╢┬ú╬ô├╢├▒Γò¼├┤Γö£ΓòóΓö¼├║╬ô├╢┬╝Γö¼Γò£Γò¼├┤Γö£ΓòóΓö¼├║╬ô├╢┬úΓö¼Γò£"
++            elif dag_type == 'sql_like':
++                dag_id = "SELECT * FROM dag"
++            elif dag_type == 'boolean_like':
++                dag_id = "false"
++            elif dag_type == 'very_long':
++                dag_id = "x" * 500
++
++            dag = types.SimpleNamespace(dag_id=dag_id)
++
++            # Execute pattern
++            if pattern == 'reset_only':
++                reset_dag(dag, session)
++            elif pattern == 'reset_then_pause':
++                reset_dag(dag, session)
++                pause_all_dags(session)
++            elif pattern == 'pause_then_reset':
++                pause_all_dags(session)
++                reset_dag(dag, session)
++            elif pattern == 'alternating':
++                reset_dag(dag, session)
++                pause_all_dags(session)
++                reset_dag(dag, session)
++                pause_all_dags(session)
++
++            # Validate semantic invariants
++            for fp in session.statement_fingerprints:
++                assert fp[1]['operation'] in ['Update', 'Delete']
++                assert fp[1]['table'] in ['dag', 'dag_run', 'task_instance']
++
++                # Validate column references
++                if 'column_references' in fp[1]:
++                    for col_ref in fp[1]['column_references']:
++                        assert col_ref in ['dag', 'dag_run', 'task_instance']
++
++    # Final hyperdimensional validation
++    assert len(session.execute_log) > 0
++
++    # Validate that all statements maintain semantic consistency
++    operation_counts = {'Update': 0, 'Delete': 0}
++    table_counts = {'dag': 0, 'dag_run': 0, 'task_instance': 0}
++
++    for fp in session.statement_fingerprints:
++        op = fp[1]['operation']
++        table = fp[1]['table']
++        operation_counts[op] += 1
++        table_counts[table] += 1
++
++    # Should have operations on all tables
++    assert all(count > 0 for count in table_counts.values())
++    assert all(count > 0 for count in operation_counts.values())

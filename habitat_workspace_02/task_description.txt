@@ -1,0 +1,108 @@
+In this task you will modify the helper functions `reset_dag` and `pause_all_dags` in
+`dev/airflow_perf/scheduler_dag_execution_timing.py` so that they interact with the database
+session using SQLAlchemy 2.0 Core statements exclusively.
+
+The script `scheduler_dag_execution_timing.py` is a performance benchmarking tool used by Airflow
+developers. It exercises the scheduler and uses these helpers to prepare and clean up state for a
+set of DAGs. For this task we only care about **how** these helpers talk to the SQLAlchemy
+`session`, not about specific database models or column names.
+
+### Helpers to update
+
+- `reset_dag(dag, session)`
+  - Accepts a DAG-like object with a `dag_id` attribute and a SQLAlchemy `session`.
+  - It is called repeatedly during the benchmark to "reset" scheduler state for that DAG.
+  - Logically, it must:
+    - Unpause that DAG by setting `is_paused=False` on its corresponding `DagModel` row(s).
+    - Delete all `DagRun` rows for that DAG.
+    - Delete all `TaskInstance` rows for that DAG.
+  - It must be safe to call multiple times in a row without raising errors (even when there are no
+    matching rows in the database).
+
+- `pause_all_dags(session)`
+  - Accepts a SQLAlchemy `session`.
+  - It is responsible for issuing a single database mutation that pauses **all** DAGs by setting
+    `is_paused=True` on every `DagModel` row.
+  - It must also be safe to call repeatedly without raising errors.
+
+From the caller’s point of view, these functions remain simple utilities that mutate scheduler
+state. Your task is to change the way they perform their database work so that they follow a very
+precise SQLAlchemy 2.0 interaction pattern.
+
+### Required SQLAlchemy 2.0 interaction pattern
+
+You must refactor these functions to use SQLAlchemy 2.0 "Core" style statements:
+
+- All database mutations (updates and deletes) must be performed via `session.execute`.
+- You must construct SQLAlchemy Core `update(...)` and `delete(...)` statements rather than
+  relying on ORM query-based `update`/`delete` methods.
+- Boolean values in generated SQL may be represented as boolean literals (false/true) or integer equivalents (0/1) depending on the database backend.
+- On every call to `reset_dag` **exactly three** `session.execute(...)` calls must be made,
+  in this order, targeting specific models and values:
+  1. An `UPDATE` against the `DagModel` table that sets `is_paused=False` for the DAG whose id is
+     `dag.dag_id`, and only for that DAG.
+  2. A `DELETE` against the `DagRun` table filtered by that same `dag_id`.
+  3. A `DELETE` against the `TaskInstance` table filtered by that same `dag_id`.
+- On every call to `pause_all_dags`, **exactly one** `UPDATE` statement must be issued via
+  `session.execute(...)` that sets `is_paused=True` on **all** `DagModel` rows with no `WHERE`
+  clause or `dag_id` filter of any kind.
+
+The functions **must not**:
+
+- Call `session.query(...)` at all for the purpose of performing updates or deletes.
+- Rely on `Query.update()` or `Query.delete()` methods.
+- Assume the presence of any real rows; they must behave correctly even if no matching
+  records exist (they simply affect zero rows without error).
+- Modify the session beyond the required `session.execute()` calls.
+- Reference any tables other than DagModel, DagRun, and TaskInstance
+- Introduce hidden side effects or attribute modifications
+- Create WHERE clauses in pause_all_dags statements
+- Allow dag_id leakage between different reset_dag calls
+- Treat boolean-like DAG IDs as booleans instead of strings
+- Execute DAG ID strings as SQL
+
+### Edge case handling
+
+The implementation must correctly handle:
+* Empty string dag_id values
+* DAG IDs containing special characters, quotes, newlines, or tabs
+* Very long DAG ID strings
+* DAG IDs that resemble SQL keywords or numeric values
+* Cross-contamination between different DAG IDs (checked via exact quoted string matches)
+* Unicode characters in DAG IDs
+* Control characters (backspace, carriage return)
+* DAG IDs that look like boolean values or SQL statements
+
+### Idempotency and determinism
+
+* Repeated calls to reset_dag with the same dag_id must emit identical statement structures.
+* Repeated calls to pause_all_dags must emit identical SQL statements across all corresponding session.execute() calls.
+* When reset_dag and pause_all_dags are interleaved, the global order of session.execute() calls must exactly follow the call order, with each reset_dag contributing three statements and each pause_all_dags contributing one statement, in sequence.
+* Parallel execution with independent sessions must produce consistent results.
+
+You may use whatever import style and local variable naming you prefer, as long as the
+behavioural requirements above are met and the rest of the script continues to work as
+before. It is acceptable (and expected) that the SQLAlchemy Core statements you build are
+recognizable as `UPDATE`/`DELETE` statement objects when observed from a fake session.
+
+### Hints
+
+<HINT>
+- The refactoring requires understanding SQLAlchemy's dual-mode session API where execute() accepts Core statements while query() represents the legacy ORM pattern.
+- Consider how statement compilation works with literal binds versus parameterized queries, especially for edge-case DAG ID values that might interfere with SQL parsing.
+- The temporal consistency requirements imply that each call must generate fresh statement objects rather than reusing cached ones, even when the same dag_id is provided.
+- Global pause operations must be distinguished from scoped updates through the absence of WHERE clauses, which requires careful construction of the Core update statement.
+- When using different sessions, statement objects must not retain any references to previous execution contexts or session state.
+- The mixed-call ordering invariant suggests that the implementation cannot defer or batch executions; each function call must immediately emit its exact sequence of statements.
+- Deep semantic understanding is required to handle DAG IDs that contain SQL keywords or injection patterns without breaking the statement structure.
+- Naive implementations might leak state between calls when handling multiple distinct DAG IDs in sequence.
+- Consider what behaviors should NOT occur, not just implementing the positive requirements.
+- Statement construction must preserve semantic meaning across complex input patterns and maintain exact execution ordering.
+- Different sessions must be completely independent in their statement generation.
+- The implementation must satisfy all requirements simultaneously across all test dimensions.
+- The implementation must properly handle quote-containing DAG IDs in SQL generation.
+- DAG IDs resembling native types (boolean, numeric) but must be treated as strings with proper quoting.
+- Statement ordering and table targeting consistency require exact table targeting patterns and consistent WHERE clause usage across all operations.
+- Deterministic structural patterns demand that all reset operations follow identical structural patterns regardless of input complexity.
+- Cross-contamination prevention between DAG IDs requires that previous DAG IDs never appear in subsequent statement SQL, ensuring complete isolation.
+</HINT>
